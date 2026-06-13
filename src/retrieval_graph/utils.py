@@ -7,12 +7,17 @@ Functions:
     get_message_text: Extract text content from various message formats.
     format_docs: Convert documents to an xml-formatted string.
 """
+import os
+from urllib.parse import urljoin
 
-
+import requests
 from langchain.chat_models import init_chat_model
 from langchain_core.documents import Document
 from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage
 from langchain_core.messages import AnyMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_openai import ChatOpenAI
 
 
 def get_message_text(msg: AnyMessage) -> str:
@@ -95,16 +100,82 @@ def format_docs(docs: list[Document] | None) -> str:
 {formatted}
 </documents>"""
 
+class CustomChatModel(BaseChatModel):
+    model_name: str = "claude-opus-4-6"
 
-def load_chat_model(fully_specified_name: str) -> BaseChatModel:
-    """Load a chat model from a fully specified name.
+    def __init__(self, model_name: str | None = None):
+        super().__init__()
+        if model_name is not None:
+            object.__setattr__(self, "model_name", model_name)
 
-    Args:
-        fully_specified_name (str): String in the format 'provider/model'.
-    """
+    @property
+    def _llm_type(self) -> str:
+        return "custom-chat-model"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        payload_messages = []
+        for m in messages:
+            role = getattr(m, "type", "user")
+            if role == "human":
+                role = "user"
+            payload_messages.append({"role": role, "content": m.content})
+
+        resp = requests.post(
+            urljoin(os.environ["CUSTOM_MODEL_URL"].rstrip("/") + "/", "chat/completions"),
+            headers={
+                "Authorization": f"Bearer {os.environ['CUSTOM_MODEL_API_KEY']}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": self.model_name,
+                "messages": payload_messages,
+                **({"stop": stop} if stop else {}),
+                **kwargs,
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+
+        data = resp.json()
+
+        if isinstance(data, dict):
+            choices = data.get("choices") or []
+            if choices:
+                choice0 = choices[0]
+                if isinstance(choice0, dict):
+                    message = choice0.get("message") or {}
+                    answer = message.get("content")
+                    if answer is not None:
+                        return ChatResult(
+                            generations=[
+                                ChatGeneration(message=AIMessage(content=answer))
+                            ]
+                        )
+            if "output" in data:
+                return ChatResult(
+                    generations=[
+                        ChatGeneration(message=AIMessage(content=data["output"]))
+                    ]
+                )
+
+        raise ValueError(f"Unexpected chat response format: {data!r}")
+
+
+def load_chat_model(fully_specified_name: str):
     if "/" in fully_specified_name:
         provider, model = fully_specified_name.split("/", maxsplit=1)
     else:
         provider = ""
         model = fully_specified_name
+
+    if provider == "custom":
+        return CustomChatModel(model_name=model)
+
+    # If we have a custom OpenAI-compatible endpoint configured, prefer it for
+    # provider-less model names so older saved configs keep working.
+    if not provider and os.getenv("CUSTOM_MODEL_URL"):
+        return CustomChatModel(model_name=model)
+
+    from langchain.chat_models import init_chat_model
     return init_chat_model(model, model_provider=provider)
+

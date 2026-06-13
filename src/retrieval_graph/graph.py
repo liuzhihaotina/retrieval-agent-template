@@ -9,6 +9,8 @@ relevant documents, and formulating responses.
 from datetime import datetime, timezone
 from typing import cast
 
+import requests
+
 from langchain_core.documents import Document
 from langchain_core.messages import BaseMessage
 from langchain_core.prompts import ChatPromptTemplate
@@ -100,9 +102,15 @@ async def retrieve(
         dict[str, list[Document]]: A dictionary with a single key "retrieved_docs"
         containing a list of retrieved Document objects.
     """
-    with retrieval.make_retriever(config) as retriever:
-        response = await retriever.ainvoke(state.queries[-1], config)
-        return {"retrieved_docs": response}
+    try:
+        with retrieval.make_retriever(config) as retriever:
+            response = await retriever.ainvoke(state.queries[-1], config)
+            return {"retrieved_docs": response}
+    except (requests.RequestException, ValueError, RuntimeError) as exc:
+        # If the embedding backend is temporarily unavailable, keep the chat flow alive
+        # and continue without retrieved context instead of crashing the whole run.
+        print(f"[retrieval] falling back to empty context because retrieval failed: {exc}")
+        return {"retrieved_docs": []}
 
 
 async def respond(

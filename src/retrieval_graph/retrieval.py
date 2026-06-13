@@ -9,30 +9,29 @@ The retrievers support filtering results by user_id to ensure data isolation bet
 import os
 from contextlib import contextmanager
 from typing import Generator
+from urllib.parse import urljoin
 
+import requests
 from langchain_core.embeddings import Embeddings
 from langchain_core.runnables import RunnableConfig
 from langchain_core.vectorstores import VectorStoreRetriever
+from langchain_openai import OpenAIEmbeddings
 
 from retrieval_graph.configuration import Configuration, IndexConfiguration
 
 ## Encoder constructors
 
-
-def make_text_encoder(model: str) -> Embeddings:
-    """Connect to the configured text encoder."""
+def make_text_encoder(model: str):
     provider, model = model.split("/", maxsplit=1)
-    match provider:
-        case "openai":
-            from langchain_openai import OpenAIEmbeddings
 
-            return OpenAIEmbeddings(model=model)
-        case "cohere":
-            from langchain_cohere import CohereEmbeddings
+    if provider == "custom":
+        # Backward-compatible fallback for the old placeholder value.
+        if model == "embedding":
+            model = "text-embedding-3-small"
+        return CustomEmbeddings(model_name=model)
 
-            return CohereEmbeddings(model=model)  # type: ignore
-        case _:
-            raise ValueError(f"Unsupported embedding provider: {provider}")
+    if provider == "openai":
+        return OpenAIEmbeddings(model=model)
 
 
 ## Retriever constructors
@@ -53,7 +52,15 @@ def make_elastic_retriever(
         }
 
     else:
-        connection_options = {"es_api_key": os.environ["ELASTICSEARCH_API_KEY"]}
+        if os.getenv("ELASTICSEARCH_API_KEY"):
+            connection_options = {
+                "es_api_key": os.environ["ELASTICSEARCH_API_KEY"]
+            }
+        else:
+            connection_options = {
+                "es_user": os.environ["ELASTICSEARCH_USER"],
+                "es_password": os.environ["ELASTICSEARCH_PASSWORD"],
+            }
 
     vstore = ElasticsearchStore(
         **connection_options,  # type: ignore
@@ -133,3 +140,53 @@ def make_retriever(
                 f"Expected one of: {', '.join(Configuration.__annotations__['retriever_provider'].__args__)}\n"
                 f"Got: {configuration.retriever_provider}"
             )
+
+
+class CustomEmbeddings(Embeddings):
+    def __init__(
+        self,
+        model_name: str = "text-embedding-3-small",
+        base_url: str | None = None,
+        api_key: str | None = None,
+    ):
+        self.model_name = model_name
+        self.base_url = base_url or os.environ["CUSTOM_MODEL_URL"]
+        self.api_key = api_key or os.environ["CUSTOM_MODEL_API_KEY"]
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [self._embed(t) for t in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed(text)
+
+    def _embed(self, text: str) -> list[float]:
+        url = urljoin(self.base_url.rstrip("/") + "/", "embeddings")
+        resp = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={"model": self.model_name, "input": text},
+            timeout=60,
+        )
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            if resp.status_code == 404:
+                raise RuntimeError(
+                    "Embedding request returned 404. "
+                    f"Check that '{self.model_name}' exists on {url!r} and that the service supports the /embeddings endpoint."
+                ) from exc
+            raise
+        data = resp.json()
+
+        if isinstance(data, dict):
+            if "data" in data and data["data"]:
+                embedding = data["data"][0].get("embedding")
+                if embedding is not None:
+                    return embedding
+            if "embedding" in data:
+                return data["embedding"]
+
+        raise ValueError(f"Unexpected embedding response format: {data!r}")
