@@ -100,6 +100,26 @@ def format_docs(docs: list[Document] | None) -> str:
 {formatted}
 </documents>"""
 
+
+def _custom_model_urls(path: str) -> list[str]:
+    """Build candidate URLs for the custom OpenAI-compatible endpoint.
+
+    If the configured HTTPS endpoint fails with an SSL handshake error, callers
+    can retry the same path over HTTP as a compatibility fallback.
+    """
+    base_url = os.environ["CUSTOM_MODEL_URL"].rstrip("/")
+    candidates = [base_url]
+    if base_url.startswith("https://"):
+        candidates.append("http://" + base_url.removeprefix("https://"))
+    elif base_url.startswith("http://"):
+        candidates.append("https://" + base_url.removeprefix("http://"))
+
+    urls: list[str] = []
+    for candidate in dict.fromkeys(candidates):
+        urls.append(urljoin(candidate.rstrip("/") + "/", path))
+    return urls
+
+
 class CustomChatModel(BaseChatModel):
     model_name: str = "claude-opus-4-6"
 
@@ -120,21 +140,33 @@ class CustomChatModel(BaseChatModel):
                 role = "user"
             payload_messages.append({"role": role, "content": m.content})
 
-        resp = requests.post(
-            urljoin(os.environ["CUSTOM_MODEL_URL"].rstrip("/") + "/", "chat/completions"),
-            headers={
-                "Authorization": f"Bearer {os.environ['CUSTOM_MODEL_API_KEY']}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": self.model_name,
-                "messages": payload_messages,
-                **({"stop": stop} if stop else {}),
-                **kwargs,
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
+        last_exc: Exception | None = None
+        resp = None
+        for url in _custom_model_urls("chat/completions"):
+            try:
+                resp = requests.post(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {os.environ['CUSTOM_MODEL_API_KEY']}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": self.model_name,
+                        "messages": payload_messages,
+                        **({"stop": stop} if stop else {}),
+                        **kwargs,
+                    },
+                    timeout=60,
+                )
+                resp.raise_for_status()
+                break
+            except requests.exceptions.SSLError as exc:
+                last_exc = exc
+                continue
+
+        if resp is None:
+            assert last_exc is not None
+            raise last_exc
 
         data = resp.json()
 

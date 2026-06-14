@@ -21,6 +21,22 @@ from retrieval_graph.configuration import Configuration, IndexConfiguration
 
 ## Encoder constructors
 
+
+def _custom_model_urls(path: str) -> list[str]:
+    """Build candidate URLs for the custom OpenAI-compatible endpoint."""
+    base_url = os.environ["CUSTOM_MODEL_URL"].rstrip("/")
+    candidates = [base_url]
+    if base_url.startswith("https://"):
+        candidates.append("http://" + base_url.removeprefix("https://"))
+    elif base_url.startswith("http://"):
+        candidates.append("https://" + base_url.removeprefix("http://"))
+
+    urls: list[str] = []
+    for candidate in dict.fromkeys(candidates):
+        urls.append(urljoin(candidate.rstrip("/") + "/", path))
+    return urls
+
+
 def make_text_encoder(model: str):
     provider, model = model.split("/", maxsplit=1)
 
@@ -160,25 +176,31 @@ class CustomEmbeddings(Embeddings):
         return self._embed(text)
 
     def _embed(self, text: str) -> list[float]:
-        url = urljoin(self.base_url.rstrip("/") + "/", "embeddings")
-        resp = requests.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json={"model": self.model_name, "input": text},
-            timeout=60,
-        )
-        try:
-            resp.raise_for_status()
-        except requests.HTTPError as exc:
-            if resp.status_code == 404:
-                raise RuntimeError(
-                    "Embedding request returned 404. "
-                    f"Check that '{self.model_name}' exists on {url!r} and that the service supports the /embeddings endpoint."
-                ) from exc
-            raise
+        last_exc: Exception | None = None
+        resp = None
+        url_used = None
+        for url in _custom_model_urls("embeddings"):
+            try:
+                resp = requests.post(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={"model": self.model_name, "input": text},
+                    timeout=60,
+                )
+                resp.raise_for_status()
+                url_used = url
+                break
+            except requests.exceptions.SSLError as exc:
+                last_exc = exc
+                continue
+
+        if resp is None:
+            assert last_exc is not None
+            raise last_exc
+
         data = resp.json()
 
         if isinstance(data, dict):

@@ -6,13 +6,13 @@ and key functions for processing user inputs, generating queries, retrieving
 relevant documents, and formulating responses.
 """
 
+import json
 from datetime import datetime, timezone
 from typing import cast
 
 import requests
-
 from langchain_core.documents import Document
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph
@@ -23,13 +23,53 @@ from retrieval_graph.configuration import Configuration
 from retrieval_graph.state import InputState, State
 from retrieval_graph.utils import format_docs, get_message_text, load_chat_model
 
-# Define the function that calls the model
-
 
 class SearchQuery(BaseModel):
     """Search the indexed documents for a query."""
 
     query: str
+
+
+_IMAGE_REQUEST_KEYWORDS = (
+    "图片",
+    "照片",
+    "出图",
+    "生成图",
+    "生成图片",
+    "生成一张",
+    "画一张",
+    "画个",
+    "绘制",
+    "图像",
+    "photorealistic",
+    "image",
+    "picture",
+    "draw",
+    "photo",
+    "portrait",
+    "illustration",
+)
+
+
+def _is_image_request(text: str) -> bool:
+    """Heuristically detect whether the user is asking for an image."""
+    normalized = text.strip().lower()
+    return any(keyword in text for keyword in _IMAGE_REQUEST_KEYWORDS) or any(
+        keyword in normalized for keyword in ("photo", "portrait", "illustration")
+    )
+
+
+def _build_image_prompt(user_text: str) -> str:
+    """Build a ready-to-use prompt for an image generation model."""
+    base = user_text.strip()
+    return (
+        "我不能直接在这里输出图片文件，但我已经把你的需求整理成可直接用于出图模型的提示词：\n\n"
+        f"{base}\n\n"
+        "推荐增强词：写实摄影、高清细节、自然光、真实毛发纹理、浅景深、"
+        "35mm镜头、ultra realistic、photorealistic、high detail、natural colors。\n"
+        "负面提示词：模糊、低清晰度、畸形、多余肢体、文字、水印、噪点。\n\n"
+        "如果你愿意，我还可以继续帮你把它改成 Midjourney / SDXL / Flux 更适配的版本。"
+    )
 
 
 async def generate_query(
@@ -40,68 +80,62 @@ async def generate_query(
     This function analyzes the messages in the state and generates an appropriate
     search query. For the first message, it uses the user's input directly.
     For subsequent messages, it uses a language model to generate a refined query.
-
-    Args:
-        state (State): The current state containing messages and other information.
-        config (RunnableConfig | None, optional): Configuration for the query generation process.
-
-    Returns:
-        dict[str, list[str]]: A dictionary with a 'queries' key containing a list of generated queries.
-
-    Behavior:
-        - If there's only one message (first user input), it uses that as the query.
-        - For subsequent messages, it uses a language model to generate a refined query.
-        - The function uses the configuration to set up the prompt and model for query generation.
     """
     messages = state.messages
+    human_input = get_message_text(messages[-1])
+    if _is_image_request(human_input):
+        return {"queries": [human_input]}
+
     if len(messages) == 1:
         # It's the first user question. We will use the input directly to search.
-        human_input = get_message_text(messages[-1])
         return {"queries": [human_input]}
-    else:
-        configuration = Configuration.from_runnable_config(config)
-        # Feel free to customize the prompt, model, and other logic!
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", configuration.query_system_prompt),
-                ("placeholder", "{messages}"),
-            ]
-        )
-        model = load_chat_model(configuration.query_model).with_structured_output(
-            SearchQuery
-        )
 
-        message_value = await prompt.ainvoke(
-            {
-                "messages": state.messages,
-                "queries": "\n- ".join(state.queries),
-                "system_time": datetime.now(tz=timezone.utc).isoformat(),
-            },
-            config,
-        )
-        generated = cast(SearchQuery, await model.ainvoke(message_value, config))
-        return {
-            "queries": [generated.query],
-        }
+    configuration = Configuration.from_runnable_config(config)
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                configuration.query_system_prompt
+                + "\n\nReturn ONLY valid JSON in the form: {{\"query\": \"...\"}}",
+            ),
+            ("placeholder", "{messages}"),
+        ]
+    )
+    model = load_chat_model(configuration.query_model)
+
+    message_value = await prompt.ainvoke(
+        {
+            "messages": state.messages,
+            "queries": "\n- ".join(state.queries),
+            "system_time": datetime.now(tz=timezone.utc).isoformat(),
+        },
+        config,
+    )
+    response = await model.ainvoke(message_value, config)
+    raw_content = get_message_text(response)
+
+    query_text = raw_content.strip()
+    if query_text.startswith("{"):
+        try:
+            parsed = json.loads(query_text)
+            if isinstance(parsed, dict) and isinstance(parsed.get("query"), str):
+                query_text = parsed["query"].strip()
+        except json.JSONDecodeError:
+            pass
+
+    if not query_text:
+        query_text = human_input
+
+    return {"queries": [query_text]}
 
 
 async def retrieve(
     state: State, *, config: RunnableConfig
 ) -> dict[str, list[Document]]:
-    """Retrieve documents based on the latest query in the state.
+    """Retrieve documents based on the latest query in the state."""
+    if state.messages and _is_image_request(get_message_text(state.messages[-1])):
+        return {"retrieved_docs": []}
 
-    This function takes the current state and configuration, uses the latest query
-    from the state to retrieve relevant documents using the retriever, and returns
-    the retrieved documents.
-
-    Args:
-        state (State): The current state containing queries and the retriever.
-        config (RunnableConfig | None, optional): Configuration for the retrieval process.
-
-    Returns:
-        dict[str, list[Document]]: A dictionary with a single key "retrieved_docs"
-        containing a list of retrieved Document objects.
-    """
     try:
         with retrieval.make_retriever(config) as retriever:
             response = await retriever.ainvoke(state.queries[-1], config)
@@ -116,9 +150,12 @@ async def retrieve(
 async def respond(
     state: State, *, config: RunnableConfig
 ) -> dict[str, list[BaseMessage]]:
-    """Call the LLM powering our "agent"."""
+    """Call the LLM powering our agent."""
+    last_user_text = get_message_text(state.messages[-1]) if state.messages else ""
+    if _is_image_request(last_user_text):
+        return {"messages": [AIMessage(content=_build_image_prompt(last_user_text))]}
+
     configuration = Configuration.from_runnable_config(config)
-    # Feel free to customize the prompt, model, and other logic!
     prompt = ChatPromptTemplate.from_messages(
         [
             ("system", configuration.response_system_prompt),
@@ -137,11 +174,7 @@ async def respond(
         config,
     )
     response = await model.ainvoke(message_value, config)
-    # We return a list, because this will get added to the existing list
     return {"messages": [response]}
-
-
-# Define a new graph (It's just a pipe)
 
 
 builder = StateGraph(State, input_schema=InputState, context_schema=Configuration)
@@ -153,10 +186,8 @@ builder.add_edge("__start__", "generate_query")
 builder.add_edge("generate_query", "retrieve")
 builder.add_edge("retrieve", "respond")
 
-# Finally, we compile it!
-# This compiles it into a graph you can invoke and deploy.
 graph = builder.compile(
-    interrupt_before=[],  # if you want to update the state before calling the tools
+    interrupt_before=[],
     interrupt_after=[],
 )
 graph.name = "RetrievalGraph"
